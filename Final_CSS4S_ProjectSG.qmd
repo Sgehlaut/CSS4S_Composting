@@ -1,0 +1,335 @@
+---
+title: "Final Project - Compost Modeling"
+author: Sid Gehlaut
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+
+# Load dependencies.
+library(tibble)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(ggforce)
+library(igraph)
+library(forcats)
+library(netrankr)
+library(magrittr)
+library(ggrepel)
+
+# Install socmod library from github (https://github.com/CSS4S/socmod).
+if (!("socmod" %in% installed.packages())) {
+  devtools::install_github("CSS4S/socmod")
+}
+```
+
+In this file, you will find all of the code I used to model composting adoption for my final paper for EBS 281.
+
+Key Helper Functions
+```{r}
+library(socmod)
+library(igraph)
+
+# Helper function to calculate the total exposure probability for a seed set and a model
+calculate_total_exposure <- function(seed_set, model) {
+  
+  # Before calculating total exposure for a seed set, reset all agents behavior to "Legacy"
+  for (agent in model$agents) {
+    agent$curr_behavior <- "Legacy"
+  }
+  
+  # Then, set the seed set's agents to "Adaptive"
+  for (agent_name in seed_set) {
+    agent <- model$get_agent(agent_name)
+    agent$curr_behavior <- "Adaptive"
+  }
+  
+  # Calculate total exposure probability by summing the exposure probabilities of all agents 
+  total_exposure <- sum(map_vec(model$agents, \(a) { a$exposure_prob() }))
+  return(total_exposure)
+}
+
+# Find total exposure for all combinations of seed set size
+find_max_exposure_seed_set <- function(seed_set_size, model, potential_seeds_idx=NULL) {
+  # Get the names of all agents
+  
+  agent_names <- sapply(model$agents, function(agent) agent$name)
+  
+  
+  if(length(agent_names) < seed_set_size) {
+  stop("Not enough agents to select the seed set of size ", seed_set_size)
+  }
+  
+  # Generate all combinations of agent names of the seed set size using "combn"
+  if(is.null(potential_seeds_idx)) {
+    combinations <- combn(agent_names, seed_set_size, simplify = FALSE)
+  }
+  else {
+    ## Make a list of the agent names from the potential seed indices
+    agent_names <- sapply(model$agents[potential_seeds_idx], \(agent){agent$name})
+    combinations <- combn(agent_names, seed_set_size, simplify = FALSE)
+  }
+  
+  # Calculate the total exposure probability for each combination of seed sets, and put into a vector 
+  exposure_values <- map_vec(combinations, function(combination) {
+    calculate_total_exposure(combination, model)
+  })
+  
+  # Find the maximum exposure value and the corresponding seed set in the vector
+  max_exposure <- max(exposure_values)
+  best_seed_set_index <- which.max(exposure_values)
+  best_seed_set <- combinations[[best_seed_set_index]]
+  
+  # Return the best seed set and its total exposure probability
+  return(list("Best Seed Set" = best_seed_set, 'Exposure' = max_exposure))
+}
+
+create_Socnet <- function(n_agents){
+  ## Set Socnet_Creation as its own function called before, then passed into make_abm50_agents
+  
+  # Initialize network with 50 agents (empty graph initially)
+  socnet <- igraph::make_empty_graph(n_agents, directed = FALSE)
+  
+  # Ensure each agent has at least one connection, with a simple ring where every agent is connected to the next one.
+  for (i in 1:(n_agents - 1)) {
+    socnet <- igraph::add_edges(socnet, c(i, i + 1))  # Connect i to i+1
+  }
+  
+  # Finally, connect the last agent (i = 50) to the first agent (i = 1) to complete the ring
+  socnet <- igraph::add_edges(socnet, c(n_agents, 1))
+  
+  # Adding 100 random edge to create an initial, random model
+  random_edges <- sample(1:n_agents, 100, replace = TRUE)
+  socnet <- igraph::add_edges(socnet, random_edges)
+  
+  return(socnet)
+}
+```
+
+Model Functions
+```{r}
+## Reset all agents to Legacy
+reset_agents <- function(model) {
+  for (agent in model$agents) {
+    agent$curr_behavior <- "Legacy"
+  }
+}
+
+## Perform partner selection as shown in toy model
+contagion_partner_selection <- function(learner, model) {
+  partner <- sample(learner$neighbors$agents, 1)[[1]]
+  return (partner)
+}
+
+la_interaction <- function(learner, partner, model) {
+  if ((learner$curr_behavior == "Legacy") && 
+      (partner$curr_behavior == "Adaptive") && 
+      (runif(1) < model$params$adopt_rate)) {
+    learner$next_behavior <- "Adaptive"
+  }
+}
+```
+
+Model Building
+```{r}
+
+n_agents <- 50
+bay_adoption_rate = .25
+chi_adoption_rate = .05
+
+# ABM builder for 50 agents with 5 adaptive and 45 legacy behaviors
+make_abm_50_agents <- function(socnet, adopt_rate) {
+  
+  # Specify behaviors (5 adaptive, 45 legacy)
+  agent_behaviors <- c(rep("Legacy", 45), rep("Adaptive", 5))
+  
+  # Assign fitness values (Legacy agents with fitness=1, Adaptive agents with fitness=2)
+  # agent_fitness <- c(rep(1, 45), rep(2, 5)) 
+  
+  ## For the final, it may be interesting be useful to use fitness and see if that changes exp prob!
+  ## Run the model and see how many times the model fixates
+  
+  # Agent names
+  agent_names <- paste0("i", 1:n_agents)
+  
+  # Create agents
+  make_agents <- function() {
+    agents <- purrr::map(
+      1:n_agents, \(a_idx) { 
+        Agent$new(behavior=agent_behaviors[a_idx], 
+                  name=agent_names[a_idx]) 
+      }
+    )
+    return(agents)
+  }
+  
+  agents <- make_agents()
+    
+  #  Set the vertex names to agent names
+  igraph::V(socnet)$name <- agent_names
+  
+  # Create the agent-based model and return it
+  return(AgentBasedModel$new(agents = agents, network = socnet, adopt_rate = adopt_rate))
+}
+
+socnet_chi_1 <- create_Socnet(n_agents)
+socnet_chi_2 <- create_Socnet(n_agents)
+socnet_chi_3 <- create_Socnet(n_agents)
+
+socnet_bay_1 <- create_Socnet(n_agents)
+socnet_bay_2 <- create_Socnet(n_agents)
+socnet_bay_3 <- create_Socnet(n_agents)
+
+# Create the agent-based model with 50 agents for Chicago and the Bay Area
+abm_50_chi_1 <- make_abm_50_agents(socnet = socnet_chi_1, adopt_rate = chi_adoption_rate)
+abm_50_chi_2 <- make_abm_50_agents(socnet = socnet_chi_2, adopt_rate = chi_adoption_rate)
+abm_50_chi_3 <- make_abm_50_agents(socnet = socnet_chi_3, adopt_rate = chi_adoption_rate)
+
+abm_50_bay_1 <- make_abm_50_agents(socnet = socnet_bay_1, adopt_rate = bay_adoption_rate)
+abm_50_bay_2 <- make_abm_50_agents(socnet = socnet_bay_2, adopt_rate = bay_adoption_rate)
+abm_50_bay_3 <- make_abm_50_agents(socnet = socnet_bay_3, adopt_rate = bay_adoption_rate)
+
+# Adjust layout and plot the network
+plot_network <- function(model, title) {
+  network <- model$network
+  
+  agent_behaviors <- sapply(model$agents, function(agent) agent$curr_behavior)
+  
+  # Set vertex colors based on agent behavior
+  vertex_colors <- ifelse(agent_behaviors == "Adaptive", "green", "white")
+  
+  # Define layout: force-directed layout (spring layout for maximum separation)
+  layout <- layout_with_fr(network)  # Use force-directed layout
+
+  # Plot the network with customizations
+  plot(
+    network,
+    layout = layout,  # Apply the layout
+    vertex.size = 15,  # Size of the vertices (nodes)
+    vertex.label.cex = 0.7,  # Size of the labels
+    vertex.label = igraph::V(network)$name,  # Show agent names as labels
+    vertex.color = vertex_colors,
+    main = title,  # Title of the plot
+    sub = "Green: Adaptive, White: Legacy",  # Subtitle to explain color coding
+    edge.width = 1,  # Edge width
+    edge.color = "grey"  # Color of the edges
+  )
+}
+
+# Call the function to plot the network
+plot_network(abm_50_chi_1, "Initial Agent-Based Model Network for Chicago")
+plot_network(abm_50_bay_1, "Initial Agent-Based Model Network for Bay Area")
+
+# Code to find "node_count" nodes with the highest degree in the model
+find_highest_degree <- function(model, node_count) {
+  
+  n_neighbors <- map_vec(model$agents, \(agent){agent$neighbors$n })
+  
+  sorted_indices <- sort(n_neighbors, index.return = TRUE, decreasing = TRUE)$ix[1:node_count]
+  
+  return(sorted_indices)
+}
+
+number_of_top_ns <- 5
+
+set_adaptive_agents <- function(abm_50) {
+  
+  ## Find the best connected indices 
+  top_indices <- find_highest_degree(abm_50, number_of_top_ns)
+  
+  ## Run the max exposure calculation, restricting our max exposure calculation to the most connected nodes.
+  best_seed_set <- find_max_exposure_seed_set(2, abm_50, potential_seeds_idx = top_indices)
+  
+  ## Convert best_seed_set into a vector
+  best_seed_set <- unlist(best_seed_set)
+  
+  # Reset all agents in the model to "Legacy"
+  reset_agents(abm_50)
+  
+  ## Set agents in the seed set to Adaptive.
+  for (agent in abm_50$agents) {
+    if (agent$name %in% best_seed_set) {
+      agent$curr_behavior <- "Adaptive"
+    }
+  }
+  
+  return(abm_50)
+}
+
+set_adaptive_agents(abm_50_chi_1)
+set_adaptive_agents(abm_50_chi_2)
+set_adaptive_agents(abm_50_chi_3)
+set_adaptive_agents(abm_50_bay_1)
+set_adaptive_agents(abm_50_bay_2)
+set_adaptive_agents(abm_50_bay_3)
+
+plot_network(abm_50_chi_1, "Seeded Agent-Based Model Network for Chicago")
+plot_network(abm_50_bay_1, "Seeded Agent-Based Model Network for Bay Area")
+```
+
+Model Running
+```{r}
+
+## Run multiple trials
+
+max_tsteps <- 250
+
+output_of_abm_50_chi_1 <- run(abm_50_chi_1, max_tsteps, contagion_partner_selection, la_interaction, iterate_learning_model)$output
+output_of_abm_50_chi_2 <- run(abm_50_chi_2, max_tsteps, contagion_partner_selection, la_interaction, iterate_learning_model)$output
+output_of_abm_50_chi_3 <- run(abm_50_chi_3, max_tsteps, contagion_partner_selection, la_interaction, iterate_learning_model)$output
+
+output_of_abm_50_bay_1 <- run(abm_50_bay_1, max_tsteps, contagion_partner_selection, la_interaction, iterate_learning_model)$output
+output_of_abm_50_bay_2 <- run(abm_50_bay_2, max_tsteps, contagion_partner_selection, la_interaction, iterate_learning_model)$output
+output_of_abm_50_bay_3 <- run(abm_50_bay_3, max_tsteps, contagion_partner_selection, la_interaction, iterate_learning_model)$output
+
+output_of_abm_50_chi_1$City <- "Chicago"
+output_of_abm_50_chi_2$City <- "Chicago"
+output_of_abm_50_chi_3$City <- "Chicago"
+
+output_of_abm_50_chi_1$Trial <- 1
+output_of_abm_50_chi_2$Trial <- 2
+output_of_abm_50_chi_3$Trial <- 3
+
+output_of_abm_50_bay_1$City <- "Bay Area"
+output_of_abm_50_bay_2$City <- "Bay Area"
+output_of_abm_50_bay_3$City <- "Bay Area"
+
+output_of_abm_50_bay_1$Trial <- 1
+output_of_abm_50_bay_2$Trial <- 2
+output_of_abm_50_bay_3$Trial <- 3
+  
+
+# Combine the two datasets
+
+combined_output <- bind_rows(output_of_abm_50_chi_1, output_of_abm_50_chi_2, output_of_abm_50_chi_3, output_of_abm_50_bay_1, output_of_abm_50_bay_2, output_of_abm_50_bay_3)
+
+## Determine where each model hits fixation and identify the first occurrence points.
+
+first_hits <- combined_output %>%
+  group_by(City, Trial) %>%
+  filter(A >= 50) %>%
+  slice_min(t, n = 1)
+
+## Graph all trials the same graph
+
+ggplot(combined_output, aes(x = t, y = A, color = City, linetype = as.factor(Trial))) +
+  geom_line() +
+  geom_point(data = first_hits, aes(x = t, y = A), size = 3, shape = 21, fill = "white") +
+  geom_label_repel(data = first_hits, aes(x = t, y = A, label = paste0("T = ", t)), 
+                   size = 4, fontface = "bold", box.padding = 0.3, 
+                   point.padding = 0.3, label.size = 0, label.padding = 0.4,
+                   segment.color = "grey50", nudge_y = 10, min.segment.length = 0,
+                   show.legend = FALSE) + 
+  scale_x_continuous(breaks = seq(0, max_tsteps, by = 25)) +
+  scale_color_manual(values = c("Chicago" = "cyan3", "Bay Area" = "brown3")) +
+  scale_linetype_manual(values = c(
+    "1" = "solid",
+    "2" = "dotted",
+    "3" = "dashed")) +
+  theme_classic() +
+  labs(x = "Time (t)", y = "Adoption (A)", color = "City", linetype = "Trial") +
+  ggtitle("Compost Adoption Over Time in Chicago vs Bay Area")
+```
